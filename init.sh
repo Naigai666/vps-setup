@@ -1,78 +1,104 @@
 #!/bin/bash
 
-# ================= 配置区域 (请修改这里) =================
-# 您的 GitHub 用户名 (用于拉取公钥)
-GITHUB_USER="Naigai666"
+# ================= 配置区域 =================
+GITHUB_USER="Naigai666" # 您的 GitHub 用户名
+SSH_PORT="24356"                   # SSH 端口
+TIMEZONE="Asia/Shanghai"           # 时区设置
+SWAP_SIZE="2048"                   # Swap 大小 (MB), 设为 0 不创建
+# ===========================================
 
-# 自定义 SSH 端口 (建议 10000-65535 之间)
-SSH_PORT="24356"
-# =======================================================
+# 颜色定义
+GREEN="\033[32m"
+RED="\033[31m"
+PLAIN="\033[0m"
 
-# 检查是否为 root 用户
+info() { echo -e "${GREEN}[INFO] $1${PLAIN}"; }
+error() { echo -e "${RED}[ERROR] $1${PLAIN}"; }
+
+# 检查 root
 if [[ $EUID -ne 0 ]]; then
-   echo "❌ 错误：必须以 root 权限运行此脚本" 
+   error "必须以 root 权限运行此脚本" 
    exit 1
 fi
 
-echo "🚀 [1/6] 系统更新与基础软件安装..."
-# 更新源并升级系统
+info "🚀 [1/8] 系统更新与基础软件安装..."
 apt update && apt upgrade -y
-# 安装基础工具、防火墙、Fail2ban
-apt install -y curl sudo vim ufw fail2ban wget net-tools git
+# 增加安装 ca-certificates 和 gnupg 用于 Docker
+apt install -y curl sudo vim ufw fail2ban wget net-tools git ca-certificates gnupg lsb-release
 
-echo "🔑 [2/6] 配置 SSH 公钥..."
+info "🕒 [2/8] 设置时区为 ${TIMEZONE}..."
+timedatectl set-timezone ${TIMEZONE}
+info "当前时间: $(date)"
+
+info "🚀 [3/8] 开启 BBR 网络加速..."
+if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
+    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+    sysctl -p
+    info "BBR 已启用"
+else
+    info "BBR 配置已存在，跳过"
+fi
+
+info "🐳 [4/8] 安装 Docker & Docker Compose..."
+if ! command -v docker &> /dev/null; then
+    curl -fsSL https://get.docker.com | bash
+    systemctl enable docker
+    systemctl start docker
+    info "Docker 安装完成"
+else
+    info "Docker 已安装，跳过"
+fi
+
+info "💾 [5/8] 配置 Swap (虚拟内存)..."
+if [ $(free -m | grep Swap | awk '{print $2}') -eq 0 ] && [ "${SWAP_SIZE}" -ne "0" ]; then
+    info "检测到未配置 Swap，正在创建 ${SWAP_SIZE}MB Swap文件..."
+    fallocate -l ${SWAP_SIZE}M /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=${SWAP_SIZE}
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+    echo "/swapfile none swap sw 0 0" >> /etc/fstab
+    info "Swap 创建成功"
+else
+    info "Swap 已存在或已禁用，跳过"
+fi
+
+info "🔑 [6/8] 配置 SSH 公钥..."
 mkdir -p /root/.ssh
 chmod 700 /root/.ssh
-# 从 GitHub 获取公钥
 curl -sL "https://github.com/${GITHUB_USER}.keys" >> /root/.ssh/authorized_keys
-
 if [ ! -s /root/.ssh/authorized_keys ]; then
-    echo "❌ 错误：无法从 GitHub 获取公钥，请检查用户名或网络。"
+    error "无法从 GitHub 获取公钥，请检查网络或用户名"
     exit 1
 fi
 chmod 600 /root/.ssh/authorized_keys
-echo "✅ 公钥配置成功。"
 
-echo "⚙️  [3/6] 修改 SSH 端口与安全设置..."
+info "⚙️  [7/8] 修改 SSH 端口与安全设置..."
 SSHD_CONFIG="/etc/ssh/sshd_config"
 cp $SSHD_CONFIG "${SSHD_CONFIG}.bak"
 
-# 1. 修改端口 (处理可能存在的 Port 配置)
+# 暴力清理旧配置并写入新配置 (更稳健的写法)
 sed -i '/^#Port/d' $SSHD_CONFIG
 sed -i '/^Port/d' $SSHD_CONFIG
-echo "Port ${SSH_PORT}" >> $SSHD_CONFIG
-
-# 2. 禁止密码登录，仅允许密钥
 sed -i '/^PasswordAuthentication/d' $SSHD_CONFIG
-echo "PasswordAuthentication no" >> $SSHD_CONFIG
-
-# 3. 允许 Root 登录 (仅限密钥)
 sed -i '/^PermitRootLogin/d' $SSHD_CONFIG
-echo "PermitRootLogin yes" >> $SSHD_CONFIG
-
-# 4. 确保公钥验证开启
 sed -i '/^PubkeyAuthentication/d' $SSHD_CONFIG
+
+echo "Port ${SSH_PORT}" >> $SSHD_CONFIG
+echo "PasswordAuthentication no" >> $SSHD_CONFIG
+echo "PermitRootLogin yes" >> $SSHD_CONFIG
 echo "PubkeyAuthentication yes" >> $SSHD_CONFIG
 
-echo "✅ SSH 配置已更新：端口 ${SSH_PORT}，禁用密码登录。"
-
-echo "🛡️  [4/6] 配置防火墙 (UFW)..."
-# 重置 UFW 规则
+info "🛡️  [8/8] 配置防火墙 (UFW) 与 Fail2ban..."
 echo "y" | ufw reset
-# 默认策略：拒绝进，允许出
 ufw default deny incoming
 ufw default allow outgoing
-# 放行 SSH 新端口
 ufw allow ${SSH_PORT}/tcp comment 'SSH Port'
-# 放行 Web 端口 (Caddy/Docker 需要)
 ufw allow 80/tcp comment 'Web HTTP'
 ufw allow 443/tcp comment 'Web HTTPS'
-# 启用防火墙
 echo "y" | ufw enable
-echo "✅ 防火墙已启用，放行端口：${SSH_PORT}, 80, 443。"
 
-echo "👮 [5/6] 配置 Fail2ban 保护 SSH..."
-# 写入自定义配置 jail.local
+# Fail2ban 配置
 cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
 bantime = 1h
@@ -86,18 +112,18 @@ port = ${SSH_PORT}
 filter = sshd
 logpath = /var/log/auth.log
 backend = systemd
-action = iptables-allports
 EOF
-
 systemctl restart fail2ban
 systemctl enable fail2ban
-echo "✅ Fail2ban 已启动并监控端口 ${SSH_PORT}。"
 
-echo "🔄 [6/6] 重启 SSH 服务..."
+info "🔄 重启 SSH 服务..."
 systemctl restart ssh
 
 echo "============================================================"
-echo "🎉 初始化脚本执行完毕！"
-echo "👉 请立即新开一个终端窗口进行连接测试 (不要关闭当前窗口)："
-echo "   ssh -p ${SSH_PORT} root@服务器IP"
+echo -e "${GREEN}🎉 系统初始化完成！${PLAIN}"
+echo -e "Hostname : $(hostname)"
+echo -e "Public IP: $(curl -s ifconfig.me)"
+echo -e "SSH Port : ${SSH_PORT}"
+echo -e "Docker   : $(docker -v)"
 echo "============================================================"
+echo "👉 请务必新开终端测试： ssh -p ${SSH_PORT} root@IP"
